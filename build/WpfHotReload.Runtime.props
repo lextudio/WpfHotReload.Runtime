@@ -1,0 +1,4 @@
+<Project>
+  <!-- packages.config consumers import build/, while PackageReference imports buildTransitive/. -->
+  <Import Project="$(MSBuildThisFileDirectory)..\buildTransitive\WpfHotReload.Runtime.props" />
+</Project>

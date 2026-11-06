@@ -1,0 +1,19 @@
+<Project>
+  <!-- Compile into the consuming agent so its WPF APIs come from the consumer's runtime closure. -->
+  <PropertyGroup>
+    <!-- The packaged source uses file-scoped namespaces. -->
+    <LangVersion Condition="'$(LangVersion)' == ''">latest</LangVersion>
+    <_WpfHotReloadRuntimeSourcesWereImported>$(WpfHotReloadRuntimeSourcesImported)</_WpfHotReloadRuntimeSourcesWereImported>
+    <WpfHotReloadRuntimeSourcesImported>true</WpfHotReloadRuntimeSourcesImported>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(_WpfHotReloadRuntimeSourcesWereImported)' != 'true'">
+    <Compile Include="$(MSBuildThisFileDirectory)..\contentFiles\any\any\WpfHotReload.Runtime\FrameworkStartupHook.cs"
+             Link="WpfHotReload.Runtime\FrameworkStartupHook.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)..\contentFiles\any\any\WpfHotReload.Runtime\ReferenceEqualityComparer.cs"
+             Link="WpfHotReload.Runtime\ReferenceEqualityComparer.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)..\contentFiles\any\any\WpfHotReload.Runtime\StartupHook.cs"
+             Link="WpfHotReload.Runtime\StartupHook.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)..\contentFiles\any\any\WpfHotReload.Runtime\WpfHotReloadAgent.cs"
+             Link="WpfHotReload.Runtime\WpfHotReloadAgent.cs" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <UseWPF>true</UseWPF>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="..\..\FrameworkStartupHook.cs" Link="FrameworkStartupHook.cs" />
+    <Compile Include="..\..\ReferenceEqualityComparer.cs" Link="ReferenceEqualityComparer.cs" />
+    <Compile Include="..\..\StartupHook.cs" Link="StartupHook.cs" />
+    <Compile Include="..\..\WpfHotReloadAgent.cs" Link="WpfHotReloadAgent.cs" />
+  </ItemGroup>
+</Project>
