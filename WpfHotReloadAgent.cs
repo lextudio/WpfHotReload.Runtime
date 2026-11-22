@@ -9,6 +9,9 @@ using System.IO.Pipes;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Reflection;
+#if NET5_0_OR_GREATER
+using System.Reflection.Metadata;
+#endif
 using System.Text;
 #if !NETFRAMEWORK
 using System.Text.Json;
@@ -619,6 +622,20 @@ public static class WpfHotReloadAgent
                             }
                         }
                     }
+                    else if (string.Equals(request.Kind, "applyDelta", StringComparison.Ordinal))
+                    {
+                        var app = Application.Current;
+                        if (app is null)
+                        {
+                            result = "error: no current WPF application";
+                        }
+                        else
+                        {
+                            // Update handlers frequently invalidate WPF caches, so run the entire
+                            // post-update sequence on the application's dispatcher.
+                            result = app.Dispatcher.Invoke(() => ApplyDeltaCore(request));
+                        }
+                    }
                     else if (request.FilePath is null || request.XamlText is null)
                     {
                         result = "error: invalid request";
@@ -672,6 +689,47 @@ public static class WpfHotReloadAgent
         Log($"PipeListenerLoop stopped, pipe={pipeName}");
     }
 
+    private static string ApplyDeltaCore(PipeRequest request)
+    {
+        if (!Guid.TryParse(request.Mvid, out var mvid)
+            || request.Metadata is null || request.Metadata.Length == 0
+            || request.Il is null || request.Il.Length == 0
+            || request.Pdb is null || request.Pdb.Length == 0
+            || request.UpdatedTypeTokens is null || request.UpdatedTypeTokens.Length == 0)
+        {
+            return "error: applyDelta needs mvid, metadata, il, pdb and updatedTypeTokens";
+        }
+
+        var assembly = AppDomain.CurrentDomain.GetAssemblies()
+            .FirstOrDefault(candidate => !candidate.IsDynamic && candidate.ManifestModule.ModuleVersionId == mvid);
+        if (assembly is null)
+            return "error: no loaded assembly has MVID " + mvid;
+        try
+        {
+#if NET5_0_OR_GREATER
+            if (!MetadataUpdater.IsSupported)
+                return "error: MetadataUpdater is not supported; launch with DOTNET_MODIFIABLE_ASSEMBLIES=debug";
+            // The public API takes ReadOnlySpan<byte>; direct invocation is intentional. The
+            // source package itself still self-builds for pre-EnC targets, but consumers compile
+            // this branch into the net10 startup-hook agent. The runtime owns token-to-type
+            // resolution for its handler callbacks; doing it against pre-update metadata would
+            // incorrectly reject valid deltas that introduce a type.
+            MetadataUpdater.ApplyUpdate(assembly, request.Metadata, request.Il, request.Pdb);
+            // MetadataUpdater itself invokes each assembly-level MetadataUpdateHandlerAttribute:
+            // all ClearCache methods, then all UpdateApplication methods. Calling them here as
+            // well would double-run user handlers and break non-idempotent implementations.
+            return "ok: applied code delta to " + assembly.GetName().Name;
+#else
+            return "error: MetadataUpdater is unavailable in this agent build";
+#endif
+        }
+        catch (Exception ex)
+        {
+            Log("applyDelta failed: " + ex);
+            return "error: " + ex.GetType().Name + ": " + ex.Message;
+        }
+    }
+
     private sealed class PipeRequest
     {
         public string? Kind { get; set; }
@@ -684,6 +742,11 @@ public static class WpfHotReloadAgent
         public string? Query { get; set; }
         public string? XNorm { get; set; }
         public string? YNorm { get; set; }
+		public string? Mvid { get; set; }
+		public byte[]? Metadata { get; set; }
+		public byte[]? Il { get; set; }
+		public byte[]? Pdb { get; set; }
+		public int[]? UpdatedTypeTokens { get; set; }
     }
 
     private sealed class PropertyChangeInfo
