@@ -51,6 +51,15 @@ public static class WpfHotReloadAgent
     // Built via VisualDiagnostics.GetXamlSourceInfo when ENABLE_XAML_DIAGNOSTICS_SOURCE_INFO=1.
     private static readonly Dictionary<SourceAnchor, WeakReference<DependencyObject>> _sourceMap = new();
     private static readonly object _sourceMapLock = new();
+
+    // Per XAML file, the last text whose apply succeeded: what a failed merge is rolled back to.
+    // Only touched on the UI thread (every apply runs through the application's dispatcher).
+    private static readonly Dictionary<string, string> _lastGoodXaml = new(StringComparer.OrdinalIgnoreCase);
+
+    // Test-only fault injection: when set, an apply whose XAML contains this text throws after the
+    // live tree was merged, which is what a real failure half-way through a merge looks like.
+    private static readonly string? _faultAfterMergeMarker =
+        Environment.GetEnvironmentVariable("WPF_HOTRELOAD_TEST_FAULT_AFTER_MERGE");
     private static volatile bool _sourceMapBuilt;
     private static volatile MethodInfo? _getXamlSourceInfoMethod;
     private static volatile MethodInfo? _getResourceDictionariesForSourceMethod;
@@ -622,6 +631,15 @@ public static class WpfHotReloadAgent
                             }
                         }
                     }
+                    else if (string.Equals(request.Kind, "runUpdateHandlers", StringComparison.Ordinal))
+                    {
+                        // A debugger applied the delta (ICorDebugModule2::ApplyChanges), which runs no
+                        // MetadataUpdateHandler: the IDE asks the agent to run them, as applyDelta does.
+                        var app = Application.Current;
+                        result = app is null
+                            ? "error: no current WPF application"
+                            : app.Dispatcher.Invoke(() => RunUpdateHandlersCore(request));
+                    }
                     else if (string.Equals(request.Kind, "applyDelta", StringComparison.Ordinal))
                     {
                         var app = Application.Current;
@@ -722,6 +740,32 @@ public static class WpfHotReloadAgent
         catch (Exception ex)
         {
             Log("applyDelta failed: " + ex);
+            return "error: " + ex.GetType().Name + ": " + ex.Message;
+        }
+    }
+
+    private static string RunUpdateHandlersCore(PipeRequest request)
+    {
+        if (!Guid.TryParse(request.Mvid, out var mvid) || request.UpdatedTypeTokens is null)
+        {
+            return "error: runUpdateHandlers needs mvid and updatedTypeTokens";
+        }
+
+        var assembly = AppDomain.CurrentDomain.GetAssemblies()
+            .FirstOrDefault(candidate => !candidate.IsDynamic && candidate.ManifestModule.ModuleVersionId == mvid);
+        if (assembly is null)
+            return "error: no loaded assembly has MVID " + mvid;
+        try
+        {
+            var handlers = FindMetadataUpdateHandlers(assembly);
+            var updatedTypes = ResolveUpdatedTypes(assembly, request.UpdatedTypeTokens);
+            foreach (var handler in handlers) InvokeMetadataUpdateHandler(handler, "ClearCache", updatedTypes);
+            foreach (var handler in handlers) InvokeMetadataUpdateHandler(handler, "UpdateApplication", updatedTypes);
+            return $"ok: ran {handlers.Length} update handler(s) in " + assembly.GetName().Name;
+        }
+        catch (Exception ex)
+        {
+            Log("runUpdateHandlers failed: " + ex);
             return "error: " + ex.GetType().Name + ": " + ex.Message;
         }
     }
@@ -1142,6 +1186,59 @@ public static class WpfHotReloadAgent
 
     private static string ApplyXamlTextCore(PipeRequest request)
     {
+        var result = ApplyXamlTextUnrecorded(request);
+        // Only a complete apply is a state to roll back to. The XML fallback reports "ok" with
+        // "| full apply skipped/failed" when the text itself could not be applied; restoring that
+        // text later would fail again.
+        if (result.StartsWith("ok", StringComparison.Ordinal)
+            && result.IndexOf("| full apply", StringComparison.Ordinal) < 0
+            && request.FilePath is not null && request.XamlText is not null)
+        {
+            _lastGoodXaml[request.FilePath] = request.XamlText;
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Puts the live tree back to the last XAML that applied (or the text the IDE says the app
+    /// started from) after a merge threw half-way. The merge is in place, so without this the
+    /// window is left as a mix of the old and the new text.
+    /// </summary>
+    private static string RestoreLastGood(string filePath, object liveRoot, string? previousXamlText)
+    {
+        if (!_lastGoodXaml.TryGetValue(filePath, out var lastGood))
+        {
+            lastGood = previousXamlText;
+        }
+
+        if (string.IsNullOrEmpty(lastGood))
+        {
+            return " | no earlier state to restore; restart the application";
+        }
+
+        try
+        {
+            var restored = ApplyParsedRoot(liveRoot, ParseXamlIgnoringEventMembers(StripCompileOnlyAttributes(lastGood!)));
+            if (!restored.StartsWith("ok", StringComparison.Ordinal))
+            {
+                return $" | restore failed: {restored}; restart the application";
+            }
+
+            // The live tree now shows this text: it is the state to return to next time, whatever the
+            // IDE then sends as previousXamlText (it may be the edit that just failed).
+            _lastGoodXaml[filePath] = lastGood!;
+            return " | restored the last applied state";
+        }
+        catch (Exception ex)
+        {
+            Log($"Restore of last good XAML failed: {ex}");
+            return $" | restore failed ({ex.GetType().Name}): {ex.Message}; restart the application";
+        }
+    }
+
+    private static string ApplyXamlTextUnrecorded(PipeRequest request)
+    {
         var filePath = request.FilePath!;
         var xamlText = request.XamlText!;
         var changeKind = request.ChangeKind;
@@ -1248,7 +1345,23 @@ public static class WpfHotReloadAgent
                 : $"{noRootError} | prior wxsg failure: {wxsgFailureMessage}";
         }
 
-        var applyResult = ApplyParsedRoot(liveRoot, parsedRoot);
+        string applyResult;
+        try
+        {
+            applyResult = ApplyParsedRoot(liveRoot, parsedRoot);
+            if (_faultAfterMergeMarker is { Length: > 0 } marker && xamlText.Contains(marker))
+            {
+                throw new InvalidOperationException("injected fault after merge (WPF_HOTRELOAD_TEST_FAULT_AFTER_MERGE)");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"Apply failed part-way: {ex}");
+            applyResult = $"error: apply failed ({ex.GetType().Name}): {ex.Message}"
+                + RestoreLastGood(filePath, liveRoot, request.PreviousXamlText);
+            BuildSourceMap();
+            return applyResult;
+        }
 
         // Rebuild source map after full tree replacement since positions may have shifted.
         BuildSourceMap();
@@ -1518,8 +1631,30 @@ public static class WpfHotReloadAgent
             "PaneTitle.Text" => (FindNamedElement(Application.Current?.MainWindow, "PaneTitle") as TextBlock)?.Text,
             "PaneBody.Text" => (FindNamedElement(Application.Current?.MainWindow, "PaneBody") as TextBlock)?.Text,
             "PaneList.SelectedIndex" => DescribeSelectorIndex(FindNamedElement(Application.Current?.MainWindow, "PaneList") as Selector),
-            _ => null,
+            _ => QueryNamedProperty(query),
         };
+    }
+
+    /// <summary>
+    /// "<c>ElementName.Property</c>": a public property of a named element in the main window,
+    /// as text, so a test can verify any edit on the live tree without a dedicated query.
+    /// </summary>
+    private static string? QueryNamedProperty(string query)
+    {
+        var dot = query.IndexOf('.');
+        if (dot <= 0 || dot == query.Length - 1 || query.IndexOf('.', dot + 1) >= 0)
+        {
+            return null;
+        }
+
+        var element = FindNamedElement(Application.Current?.MainWindow, query.Substring(0, dot));
+        var property = element?.GetType().GetProperty(query.Substring(dot + 1), BindingFlags.Public | BindingFlags.Instance);
+        if (property is null || property.GetIndexParameters().Length != 0)
+        {
+            return null;
+        }
+
+        return Convert.ToString(property.GetValue(element), System.Globalization.CultureInfo.InvariantCulture);
     }
 
     private static PipeRequest? DeserializePipeRequest(string line)
@@ -3402,7 +3537,11 @@ public static class WpfHotReloadAgent
                         continue;
                     }
 
-                    if (TryApplyPropertyValue(liveElement, attribute.Name.LocalName, attribute.Value))
+                    // "{}" escapes a literal that starts with a brace; the XAML parser drops it, so must this.
+                    var literal = attribute.Value.TrimStart().StartsWith("{}", StringComparison.Ordinal)
+                        ? attribute.Value.TrimStart().Substring(2)
+                        : attribute.Value;
+                    if (TryApplyPropertyValue(liveElement, attribute.Name.LocalName, literal))
                     {
                         perElementUpdates++;
                     }
@@ -3455,6 +3594,14 @@ public static class WpfHotReloadAgent
 
         // Attached properties (Grid.Row, etc.) are skipped in this fallback path.
         if (attribute.Name.LocalName.Contains('.'))
+        {
+            return false;
+        }
+
+        // A markup extension ({Binding}, {StaticResource}, {cs: ...}) is not a literal: setting its
+        // text would show the markup itself in the running UI. "{}" escapes a literal brace.
+        var value = attribute.Value.TrimStart();
+        if (value.StartsWith("{", StringComparison.Ordinal) && !value.StartsWith("{}", StringComparison.Ordinal))
         {
             return false;
         }
