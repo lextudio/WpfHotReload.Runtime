@@ -10,6 +10,14 @@ public static class StartupHook
     {
         try
         {
+            // DOTNET_STARTUP_HOOKS is inherited by child processes (dotnet watch, build hosts), and
+            // they would race the app for the same pipe. Only a process that can resolve WPF is the
+            // target application; loading the assembly does not touch any WPF object.
+            if (!CanResolveWpf())
+            {
+                return;
+            }
+
             // Avoid touching WPF objects from startup-hook threads.
             // The agent itself is resilient when Application.Current is not ready yet.
             WpfHotReloadAgent.EnsurePipeListenerStarted();
@@ -17,6 +25,19 @@ public static class StartupHook
         catch
         {
             // Never crash the host app because of hot reload plumbing.
+        }
+    }
+
+    private static bool CanResolveWpf()
+    {
+        try
+        {
+            System.Reflection.Assembly.Load(new System.Reflection.AssemblyName("PresentationFramework"));
+            return true;
+        }
+        catch
+        {
+            return false;
         }
     }
 }
