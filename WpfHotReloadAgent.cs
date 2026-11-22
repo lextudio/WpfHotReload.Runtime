@@ -709,15 +709,11 @@ public static class WpfHotReloadAgent
 #if NET5_0_OR_GREATER
             if (!MetadataUpdater.IsSupported)
                 return "error: MetadataUpdater is not supported; launch with DOTNET_MODIFIABLE_ASSEMBLIES=debug";
-            // The public API takes ReadOnlySpan<byte>; direct invocation is intentional. The
-            // source package itself still self-builds for pre-EnC targets, but consumers compile
-            // this branch into the net10 startup-hook agent. The runtime owns token-to-type
-            // resolution for its handler callbacks; doing it against pre-update metadata would
-            // incorrectly reject valid deltas that introduce a type.
+			var handlers = FindMetadataUpdateHandlers(assembly);
+			var updatedTypes = ResolveUpdatedTypes(assembly, request.UpdatedTypeTokens);
+			foreach (var handler in handlers) InvokeMetadataUpdateHandler(handler, "ClearCache", updatedTypes);
             MetadataUpdater.ApplyUpdate(assembly, request.Metadata, request.Il, request.Pdb);
-            // MetadataUpdater itself invokes each assembly-level MetadataUpdateHandlerAttribute:
-            // all ClearCache methods, then all UpdateApplication methods. Calling them here as
-            // well would double-run user handlers and break non-idempotent implementations.
+			foreach (var handler in handlers) InvokeMetadataUpdateHandler(handler, "UpdateApplication", updatedTypes);
             return "ok: applied code delta to " + assembly.GetName().Name;
 #else
             return "error: MetadataUpdater is unavailable in this agent build";
@@ -729,6 +725,30 @@ public static class WpfHotReloadAgent
             return "error: " + ex.GetType().Name + ": " + ex.Message;
         }
     }
+
+	private static Type[] ResolveUpdatedTypes(Assembly assembly, int[] tokens)
+	{
+		return tokens.Select(token => {
+			try { return assembly.ManifestModule.ResolveType(token); }
+			catch (ArgumentException) { return null; }
+		}).Where(type => type is not null).Cast<Type>().ToArray();
+	}
+
+	private static Type[] FindMetadataUpdateHandlers(Assembly assembly)
+	{
+		return assembly.GetCustomAttributesData()
+			.Where(attribute => attribute.AttributeType.FullName == "System.Reflection.Metadata.MetadataUpdateHandlerAttribute")
+			.Select(attribute => attribute.ConstructorArguments.Count == 1 ? attribute.ConstructorArguments[0].Value as Type : null)
+			.Where(type => type is not null).Cast<Type>().ToArray();
+	}
+
+	private static void InvokeMetadataUpdateHandler(Type handler, string name, Type[] updatedTypes)
+	{
+		var method = handler.GetMethod(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
+			null, new[] { typeof(Type[]) }, null);
+		try { method?.Invoke(null, new object[] { updatedTypes }); }
+		catch (TargetInvocationException ex) when (ex.InnerException is not null) { throw ex.InnerException; }
+	}
 
     private sealed class PipeRequest
     {
