@@ -60,6 +60,11 @@ public static class WpfHotReloadAgent
     // live tree was merged, which is what a real failure half-way through a merge looks like.
     private static readonly string? _faultAfterMergeMarker =
         Environment.GetEnvironmentVariable("WPF_HOTRELOAD_TEST_FAULT_AFTER_MERGE");
+
+    // Test-only fault injection: when set, the merge that restores the last good XAML throws too, so the
+    // atomic content replacement behind it is what puts the window back together.
+    private static readonly bool _faultRestoreMerge =
+        !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WPF_HOTRELOAD_TEST_FAULT_RESTORE_MERGE"));
     private static volatile bool _sourceMapBuilt;
     private static volatile MethodInfo? _getXamlSourceInfoMethod;
     private static volatile MethodInfo? _getResourceDictionariesForSourceMethod;
@@ -1203,7 +1208,10 @@ public static class WpfHotReloadAgent
     /// <summary>
     /// Puts the live tree back to the last XAML that applied (or the text the IDE says the app
     /// started from) after a merge threw half-way. The merge is in place, so without this the
-    /// window is left as a mix of the old and the new text.
+    /// window is left as a mix of the old and the new text. The restore is itself a merge and can
+    /// fail half-way too; then the root's content is replaced by a fresh tree of that text in one
+    /// assignment, which cannot leave a mix (it resets control state, and code-behind x:Name fields
+    /// keep pointing at the replaced elements). Only when that fails as well is a restart needed.
     /// </summary>
     private static string RestoreLastGood(string filePath, object liveRoot, string? previousXamlText)
     {
@@ -1217,24 +1225,74 @@ public static class WpfHotReloadAgent
             return " | no earlier state to restore; restart the application";
         }
 
+        string mergeFailure;
         try
         {
-            var restored = ApplyParsedRoot(liveRoot, ParseXamlIgnoringEventMembers(StripCompileOnlyAttributes(lastGood!)));
-            if (!restored.StartsWith("ok", StringComparison.Ordinal))
+            if (_faultRestoreMerge)
             {
-                return $" | restore failed: {restored}; restart the application";
+                throw new InvalidOperationException("injected fault during restore (WPF_HOTRELOAD_TEST_FAULT_RESTORE_MERGE)");
             }
 
-            // The live tree now shows this text: it is the state to return to next time, whatever the
-            // IDE then sends as previousXamlText (it may be the edit that just failed).
-            _lastGoodXaml[filePath] = lastGood!;
-            return " | restored the last applied state";
+            var restored = ApplyParsedRoot(liveRoot, ParseXamlIgnoringEventMembers(StripCompileOnlyAttributes(lastGood!)));
+            if (restored.StartsWith("ok", StringComparison.Ordinal))
+            {
+                // The live tree now shows this text: it is the state to return to next time, whatever the
+                // IDE then sends as previousXamlText (it may be the edit that just failed).
+                _lastGoodXaml[filePath] = lastGood!;
+                return " | restored the last applied state";
+            }
+
+            mergeFailure = restored;
         }
         catch (Exception ex)
         {
-            Log($"Restore of last good XAML failed: {ex}");
+            Log($"Restore merge of last good XAML failed: {ex}");
+            mergeFailure = $"{ex.GetType().Name}: {ex.Message}";
+        }
+
+        try
+        {
+            // A fresh parse: the failed merge may already have moved elements out of the first one.
+            var fresh = ParseXamlIgnoringEventMembers(StripCompileOnlyAttributes(lastGood!));
+            if (TryReplaceRootContent(liveRoot, fresh))
+            {
+                _lastGoodXaml[filePath] = lastGood!;
+                return $" | restore merge failed ({mergeFailure}); replaced the content with the last applied state, control state was reset";
+            }
+
+            return $" | restore failed: {mergeFailure}; the root cannot be replaced atomically; restart the application";
+        }
+        catch (Exception ex)
+        {
+            Log($"Atomic replacement with last good XAML failed: {ex}");
             return $" | restore failed ({ex.GetType().Name}): {ex.Message}; restart the application";
         }
+    }
+
+    /// <summary>
+    /// Moves the parsed root's single content into the live root in one assignment. Only for roots
+    /// whose visual content is one property (Window, UserControl and other content controls,
+    /// decorators); a panel's children cannot be swapped in one step.
+    /// </summary>
+    private static bool TryReplaceRootContent(object liveRoot, object parsedRoot)
+    {
+        if (liveRoot is ContentControl liveContentControl && parsedRoot is ContentControl parsedContentControl)
+        {
+            var content = parsedContentControl.Content;
+            parsedContentControl.Content = null;
+            liveContentControl.Content = content;
+            return true;
+        }
+
+        if (liveRoot is Decorator liveDecorator && parsedRoot is Decorator parsedDecorator)
+        {
+            var child = parsedDecorator.Child;
+            parsedDecorator.Child = null;
+            liveDecorator.Child = child;
+            return true;
+        }
+
+        return false;
     }
 
     private static string ApplyXamlTextUnrecorded(PipeRequest request)
